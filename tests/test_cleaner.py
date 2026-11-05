@@ -10,7 +10,7 @@ import pypdfium2 as pdfium
 import pytest
 from PIL import Image, ImageChops
 
-from invisible_mark_cleaner import CleanError, MarkKind, clean_pdf, suggested_output_path
+from invisible_mark_cleaner import CleanError, MarkKind, analyze_pdf, clean_pdf, suggested_output_path
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -251,3 +251,36 @@ def test_unreadable_input_raises_clean_error_and_writes_nothing(fixture: str, wo
     with pytest.raises(CleanError):
         clean_pdf(source)
     assert sorted(p.name for p in workdir.iterdir()) == [fixture]
+
+
+@pytest.mark.parametrize("case", CASES, ids=lambda c: c.fixture)
+def test_analysis_reports_the_same_marks_and_writes_nothing(case: Case, workdir: Path):
+    source = workdir / case.fixture
+    shutil.copy(FIXTURES / case.fixture, source)
+    original = source.read_bytes()
+    analysis = analyze_pdf(source)
+    assert sorted(p.name for p in workdir.iterdir()) == [case.fixture]
+    assert source.read_bytes() == original
+    assert analysis.source == source
+    assert analysis.has_marks == bool(analysis.findings)
+    content = {(f.kind, f.page, f.text) for f in analysis.findings if f.kind is not MarkKind.METADATA}
+    assert content == case.marks
+    assert analysis.findings == clean_pdf(source).findings
+
+
+def test_analysis_of_a_document_without_marks_has_none(workdir: Path):
+    source = workdir / "clean_document.pdf"
+    shutil.copy(FIXTURES / "clean_document.pdf", source)
+    analysis = analyze_pdf(source)
+    assert analysis.findings == ()
+    assert analysis.has_marks is False
+
+
+@pytest.mark.parametrize("fixture", ["encrypted.pdf", "not_a_pdf.pdf", "missing.pdf"])
+def test_analysis_of_unreadable_input_raises_clean_error(fixture: str, workdir: Path):
+    source = workdir / fixture
+    if (FIXTURES / fixture).exists():
+        shutil.copy(FIXTURES / fixture, source)
+    with pytest.raises(CleanError):
+        analyze_pdf(source)
+    assert sorted(p.name for p in workdir.iterdir()) == ([fixture] if source.exists() else [])

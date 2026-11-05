@@ -3,9 +3,10 @@ from __future__ import annotations
 import argparse
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QObject, QThread, QUrl, Qt, Signal
+from PySide6.QtCore import QEvent, QObject, QSettings, QThread, QUrl, Qt, Signal
 from PySide6.QtGui import QDesktopServices, QFont
 from PySide6.QtWidgets import (
     QApplication,
@@ -25,25 +26,36 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from invisible_mark_cleaner import CleanError, clean_pdf
+from invisible_mark_cleaner import CleanError, analyze_pdf, clean_pdf
 from invisible_mark_cleaner.present import (
+    clean_label,
+    file_status,
     finding_rows,
+    results_summary,
     reveal_command,
     reveal_label,
     summary,
     write_report_json,
 )
 from invisible_mark_cleaner.session import (
-    DROP_ONE_PDF,
+    BUSY,
+    DROP_PDFS_ONLY,
+    SAME_AS_ORIGINAL,
+    Analyzing,
     CleanFailure,
-    Done,
-    Failed,
+    Cleaning,
+    FileResult,
     Idle,
+    Results,
     Session,
-    Working,
     clean_failure,
-    single_pdf,
+    pdf_paths,
+    to_clean,
+    with_result,
 )
+
+APP_NAME = "Invisible Mark Cleaner"
+LAST_DIRECTORY = "last_directory"
 
 STYLESHEET = """
 QMainWindow, QWidget#page {
@@ -100,6 +112,10 @@ QPushButton#secondary {
 QPushButton#secondary:hover {
     background: #d5dbe4;
 }
+QPushButton:disabled {
+    background: #c9d0da;
+    color: #f4f6f9;
+}
 QTableWidget {
     background: #ffffff;
     alternate-background-color: #f6f8fb;
@@ -142,7 +158,7 @@ def prepare_application() -> None:
 class CleanerApplication(QApplication):
     def __init__(self, argv: list[str]) -> None:
         super().__init__(argv)
-        self.setApplicationDisplayName("Invisible Mark Cleaner")
+        self.setApplicationDisplayName(APP_NAME)
         self.setStyle("Fusion")
         font = QFont(self.font())
         font.setPointSize(12)
@@ -167,37 +183,37 @@ class CleanerApplication(QApplication):
         self._window = window
         queued = list(self._queued)
         self._queued.clear()
-        for path in queued:
-            window.submit_pdf(path)
+        if queued:
+            window.receive_paths(queued)
 
 
-class _CleanWorker(QThread):
+class _Job(QThread):
     succeeded = Signal(int, object)
     failed = Signal(int, object)
 
-    def __init__(self, token: int, source: Path, output: Path | None) -> None:
+    def __init__(self, token: int, work: Callable[[], object]) -> None:
         super().__init__()
         self._token = token
-        self._source = source
-        self._output = output
+        self._work = work
 
     def run(self) -> None:
         try:
-            report = clean_pdf(self._source, self._output)
+            result = self._work()
         except Exception as exc:
             self.failed.emit(self._token, clean_failure(exc))
         else:
-            self.succeeded.emit(self._token, report)
+            self.succeeded.emit(self._token, result)
 
 
 class MainWindow(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, settings: QSettings | None = None) -> None:
         super().__init__()
-        self.setWindowTitle("Invisible Mark Cleaner")
+        self.setWindowTitle(APP_NAME)
         self.setMinimumSize(760, 520)
         self.resize(880, 640)
         self.session: Session = Idle()
-        self._worker: _CleanWorker | None = None
+        self.settings = settings if settings is not None else QSettings(APP_NAME, APP_NAME)
+        self._worker: _Job | None = None
         self._token = 0
 
         root = QWidget()
@@ -205,7 +221,7 @@ class MainWindow(QMainWindow):
         outer = QVBoxLayout(root)
         outer.setContentsMargins(28, 24, 28, 24)
         outer.setSpacing(16)
-        title = QLabel("Invisible Mark Cleaner")
+        title = QLabel(APP_NAME)
         title.setObjectName("appTitle")
         outer.addWidget(title)
 
@@ -215,9 +231,8 @@ class MainWindow(QMainWindow):
 
         self.idle_page = self._build_idle()
         self.working_page = self._build_working()
-        self.done_page = self._build_done()
-        self.failed_page = self._build_failed()
-        for page in (self.idle_page, self.working_page, self.done_page, self.failed_page):
+        self.results_page = self._build_results()
+        for page in (self.idle_page, self.working_page, self.results_page):
             self.stack.addWidget(page)
 
         self._accept_drops(root)
@@ -280,14 +295,20 @@ class MainWindow(QMainWindow):
         event.acceptProposedAction()
 
     def receive_paths(self, paths: list[Path]) -> None:
-        if isinstance(self.session, Working):
+        session = self.session
+        if isinstance(session, Cleaning):
             return
-        chosen = single_pdf(paths)
-        if chosen is None:
-            self.apply(Idle(DROP_ONE_PDF))
+        sources = pdf_paths(paths)
+        if isinstance(session, Analyzing):
+            extra = tuple(path for path in sources or () if path not in session.sources)
+            if extra:
+                self.apply(Analyzing(session.sources + extra, session.done))
             return
-        self.apply(Working(chosen))
-        self._start(chosen, None)
+        if sources is None:
+            self.apply(Idle(DROP_PDFS_ONLY))
+            return
+        self.apply(Analyzing(sources))
+        self._analyze_next()
 
     def submit_pdf(self, source: Path) -> None:
         self.receive_paths([source])
@@ -297,41 +318,90 @@ class MainWindow(QMainWindow):
         if isinstance(session, Idle):
             self._render_idle(session)
             self.stack.setCurrentWidget(self.idle_page)
-        elif isinstance(session, Working):
+        elif isinstance(session, (Analyzing, Cleaning)):
             self._render_working(session)
             self.stack.setCurrentWidget(self.working_page)
-        elif isinstance(session, Done):
-            self._render_done(session)
-            self.stack.setCurrentWidget(self.done_page)
-        elif isinstance(session, Failed):
-            self._render_failed(session)
-            self.stack.setCurrentWidget(self.failed_page)
+        elif isinstance(session, Results):
+            self._render_results(session)
+            self.stack.setCurrentWidget(self.results_page)
         else:
             raise TypeError(type(session))
 
-    def _start(self, source: Path, output: Path | None) -> None:
+    def _start(self, work: Callable[[], object]) -> None:
+        previous = self._worker
+        if previous is not None:
+            previous.wait()
         self._token += 1
-        token = self._token
-        worker = _CleanWorker(token, source, output)
+        worker = _Job(self._token, work)
         worker.succeeded.connect(self._on_succeeded, Qt.ConnectionType.QueuedConnection)
         worker.failed.connect(self._on_failed, Qt.ConnectionType.QueuedConnection)
         self._worker = worker
         worker.start()
 
-    def _on_succeeded(self, token: int, report) -> None:
+    def _analyze_next(self) -> None:
+        source = self.session.current
+        self._start(lambda: analyze_pdf(source))
+
+    def _clean_next(self) -> None:
+        source, output = self.session.current, self.session.output
+        self._start(lambda: clean_pdf(source, output))
+
+    def _on_succeeded(self, token: int, result) -> None:
         if token != self._token:
             return
-        self.apply(Done(report))
+        session = self.session
+        if isinstance(session, Analyzing):
+            self._analyzed(FileResult(session.current, analysis=result))
+        elif isinstance(session, Cleaning):
+            self._cleaned(report=result)
 
     def _on_failed(self, token: int, failure: CleanFailure) -> None:
         if token != self._token:
             return
-        if failure.save_as is not None and isinstance(self.session, Working):
-            self._prompt_save_as(self.session.source, failure)
-            return
-        self.apply(Failed(failure.message))
+        session = self.session
+        if isinstance(session, Analyzing):
+            self._analyzed(FileResult(session.current, error=failure.message))
+        elif isinstance(session, Cleaning):
+            if failure.save_as is not None:
+                self._prompt_save_as(session, failure)
+            else:
+                self._cleaned(clean_error=failure.message)
 
-    def _prompt_save_as(self, source: Path, failure: CleanFailure) -> None:
+    def _analyzed(self, result: FileResult) -> None:
+        session = self.session
+        done = session.done + (result,)
+        if len(done) < len(session.sources):
+            self.apply(Analyzing(session.sources, done))
+            self._analyze_next()
+        else:
+            self.files_table.setCurrentCell(-1, -1)
+            self.apply(Results(done))
+
+    def _clean(self) -> None:
+        if not isinstance(self.session, Results):
+            return
+        pending = to_clean(self.session.files)
+        if not pending:
+            return
+        self.apply(Cleaning(self.session.files, pending))
+        self._clean_next()
+
+    def _cleaned(self, report=None, clean_error: str | None = None) -> None:
+        session = self.session
+        files = with_result(session.files, session.pending[0], report=report, clean_error=clean_error)
+        rest = session.pending[1:]
+        if rest:
+            self.apply(Cleaning(files, rest))
+            self._clean_next()
+            return
+        if files[self._selected_index(files)].report is None:
+            cleaned = [index for index, result in enumerate(files) if result.report is not None]
+            if cleaned:
+                self.files_table.setCurrentCell(cleaned[0], 0)
+        self.apply(Results(files))
+
+    def _prompt_save_as(self, session: Cleaning, failure: CleanFailure) -> None:
+        source = session.current
         suggested = str(failure.save_as) if failure.save_as is not None else ""
         chosen, _selected = QFileDialog.getSaveFileName(
             self,
@@ -340,7 +410,7 @@ class MainWindow(QMainWindow):
             "PDF files (*.pdf)",
         )
         if not chosen:
-            self.apply(Failed(failure.message))
+            self._cleaned(clean_error=failure.message)
             return
         dest = Path(chosen)
         if dest.suffix.lower() != ".pdf":
@@ -350,35 +420,59 @@ class MainWindow(QMainWindow):
         except OSError:
             same = False
         if same:
-            self.apply(Failed("Choose a different file. The original PDF stays as it is."))
+            self._cleaned(clean_error=SAME_AS_ORIGINAL)
             return
-        self.apply(Working(source, dest))
-        self._start(source, dest)
+        self.apply(Cleaning(session.files, session.pending, dest))
+        self._clean_next()
+
+    def last_directory(self) -> str:
+        folder = self.settings.value(LAST_DIRECTORY, "", type=str)
+        if folder and Path(folder).is_dir():
+            return folder
+        return str(Path.home())
+
+    def _remember_directory(self, folder: Path) -> None:
+        self.settings.setValue(LAST_DIRECTORY, str(folder))
+        self.settings.sync()
 
     def _choose(self) -> None:
-        if isinstance(self.session, Working):
+        if isinstance(self.session, BUSY):
             return
-        chosen, _selected = QFileDialog.getOpenFileName(
+        chosen, _selected = QFileDialog.getOpenFileNames(
             self,
-            "Choose PDF",
-            str(Path.home()),
+            "Choose PDFs",
+            self.last_directory(),
             "PDF files (*.pdf)",
         )
         if chosen:
-            self.receive_paths([Path(chosen)])
+            paths = [Path(path) for path in chosen]
+            self._remember_directory(paths[0].parent)
+            self.receive_paths(paths)
+
+    def _selected_index(self, files: tuple[FileResult, ...]) -> int:
+        row = self.files_table.currentRow()
+        return row if 0 <= row < len(files) else 0
+
+    def selected_file(self) -> FileResult | None:
+        if not isinstance(self.session, Results):
+            return None
+        files = self.session.files
+        return files[self._selected_index(files)]
 
     def _reveal(self) -> None:
-        if not isinstance(self.session, Done):
+        selected = self.selected_file()
+        if selected is None or selected.report is None:
             return
-        subprocess.run(reveal_command(self.session.report.output), check=False)
+        subprocess.run(reveal_command(selected.report.output), check=False)
 
     def _open_pdf(self) -> None:
-        if not isinstance(self.session, Done):
+        selected = self.selected_file()
+        if selected is None or selected.report is None:
             return
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.session.report.output)))
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(selected.report.output)))
 
     def _reset(self) -> None:
-        if isinstance(self.session, Working):
+        if isinstance(self.session, BUSY):
             return
         self.apply(Idle())
 
@@ -396,10 +490,11 @@ class MainWindow(QMainWindow):
         zone_layout = QVBoxLayout(zone)
         zone_layout.setContentsMargins(24, 24, 24, 24)
         zone_layout.addStretch(1)
-        drop_title = QLabel("Drop a PDF here")
+        drop_title = QLabel("Drop PDFs here")
         drop_title.setObjectName("dropTitle")
         drop_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        hint = QLabel("One PDF. The original stays where it is.")
+        hint = QLabel("One or more PDFs. They are checked first. Nothing is saved until you click Clean PDF.")
+        hint.setWordWrap(True)
         hint.setObjectName("dropHint")
         hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         zone_layout.addWidget(drop_title)
@@ -407,7 +502,7 @@ class MainWindow(QMainWindow):
         zone_layout.addWidget(hint)
         zone_layout.addStretch(1)
 
-        self.choose_button = QPushButton("Choose PDF...")
+        self.choose_button = QPushButton("Choose PDFs...")
         self.choose_button.setMinimumWidth(180)
         self.choose_button.clicked.connect(self._choose)
         self.choose_button.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -436,7 +531,8 @@ class MainWindow(QMainWindow):
         self.working_label = QLabel("Checking...")
         self.working_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.working_label.setWordWrap(True)
-        hint = QLabel("The original file is left as it is.")
+        self.working_hint = QLabel("")
+        hint = self.working_hint
         hint.setObjectName("workingHint")
         hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         bar_row = QHBoxLayout()
@@ -454,7 +550,7 @@ class MainWindow(QMainWindow):
         layout.addStretch(1)
         return page
 
-    def _build_done(self) -> QWidget:
+    def _build_results(self) -> QWidget:
         page = QWidget()
         page.setObjectName("page")
         layout = QVBoxLayout(page)
@@ -468,18 +564,36 @@ class MainWindow(QMainWindow):
         self.path_label.setWordWrap(True)
         self.path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
 
+        self.files_table = QTableWidget(0, 2)
+        self.files_table.setHorizontalHeaderLabels(["PDF", "Result"])
+        self.files_table.verticalHeader().setVisible(False)
+        self.files_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.files_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.files_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.files_table.setTextElideMode(Qt.TextElideMode.ElideMiddle)
+        self.files_table.setWordWrap(False)
+        self.files_table.setShowGrid(False)
+        files_header = self.files_table.horizontalHeader()
+        files_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        files_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.files_table.currentCellChanged.connect(self._on_file_selected)
+
+        self.clean_button = QPushButton(clean_label(1))
         self.reveal_button = QPushButton(reveal_label())
         self.reveal_button.setObjectName("secondary")
         self.open_button = QPushButton("Open clean PDF")
-        self.again_button = QPushButton("Clean another PDF")
+        self.open_button.setObjectName("secondary")
+        self.again_button = QPushButton("Check other PDFs")
         self.again_button.setObjectName("secondary")
-        for button in (self.reveal_button, self.open_button, self.again_button):
+        for button in (self.clean_button, self.reveal_button, self.open_button, self.again_button):
             button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.clean_button.clicked.connect(self._clean)
         self.reveal_button.clicked.connect(self._reveal)
         self.open_button.clicked.connect(self._open_pdf)
         self.again_button.clicked.connect(self._reset)
         row = QHBoxLayout()
         row.setSpacing(8)
+        row.addWidget(self.clean_button)
         row.addWidget(self.reveal_button)
         row.addWidget(self.open_button)
         row.addStretch(1)
@@ -503,32 +617,12 @@ class MainWindow(QMainWindow):
         header.setStretchLastSection(True)
 
         layout.addWidget(self.summary_label)
+        layout.addWidget(self.files_table)
         layout.addWidget(self.path_label)
         layout.addLayout(row)
         layout.addWidget(self.table, 1)
-        return page
-
-    def _build_failed(self) -> QWidget:
-        page = QWidget()
-        page.setObjectName("page")
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.addStretch(1)
-        self.failed_label = QLabel("")
-        self.failed_label.setObjectName("failedMessage")
-        self.failed_label.setWordWrap(True)
-        self.failed_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.retry_button = QPushButton("Try another PDF")
-        self.retry_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.retry_button.clicked.connect(self._reset)
-        button_row = QHBoxLayout()
-        button_row.addStretch(1)
-        button_row.addWidget(self.retry_button)
-        button_row.addStretch(1)
-        layout.addWidget(self.failed_label)
-        layout.addSpacing(16)
-        layout.addLayout(button_row)
-        layout.addStretch(1)
+        self.results_spacer = QWidget()
+        layout.addWidget(self.results_spacer, 1)
         return page
 
     def _render_idle(self, session: Idle) -> None:
@@ -536,15 +630,59 @@ class MainWindow(QMainWindow):
         self.notice_label.setText(notice)
         self.notice_label.setVisible(bool(notice))
 
-    def _render_working(self, session: Working) -> None:
-        self.working_label.setText(f"Checking {session.source.name}...")
+    def _render_working(self, session: Analyzing | Cleaning) -> None:
+        if isinstance(session, Analyzing):
+            verb, position, total = "Checking", len(session.done) + 1, len(session.sources)
+            self.working_hint.setText("Nothing is saved while checking.")
+        else:
+            cleaned = sum(1 for result in session.files if result.report is not None)
+            verb, position, total = "Cleaning", cleaned + 1, cleaned + len(session.pending)
+            self.working_hint.setText("The original file is left as it is.")
+        progress = f" ({position} of {total})" if total > 1 else ""
+        self.working_label.setText(f"{verb} {session.current.name}{progress}...")
 
-    def _render_done(self, session: Done) -> None:
-        report = session.report
-        self.summary_label.setText(summary(report))
-        self.path_label.setText(str(report.output))
+    def _render_results(self, session: Results) -> None:
+        files = session.files
+        selected = self._selected_index(files)
+        self.files_table.blockSignals(True)
+        self.files_table.setRowCount(len(files))
+        for row_index, result in enumerate(files):
+            for column, value in enumerate((result.source.name, file_status(result))):
+                item = QTableWidgetItem(value)
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                item.setToolTip(str(result.source) if column == 0 else value)
+                self.files_table.setItem(row_index, column, item)
+        self.files_table.setCurrentCell(selected, 0)
+        self.files_table.blockSignals(False)
+        self.files_table.resizeRowsToContents()
+        visible_rows = sum(self.files_table.rowHeight(row) for row in range(min(len(files), 5)))
+        frame = 2 * self.files_table.frameWidth()
+        self.files_table.setFixedHeight(self.files_table.horizontalHeader().sizeHint().height() + visible_rows + frame)
+        self.files_table.setVisible(len(files) > 1)
+        self.summary_label.setText(results_summary(files))
+
+        pending = to_clean(files)
+        cleaned_any = any(result.report is not None for result in files)
+        self.clean_button.setText(clean_label(len(pending)))
+        self.clean_button.setEnabled(bool(pending))
+        self.clean_button.setVisible(bool(pending) or not cleaned_any)
+        self._render_selection()
+
+    def _on_file_selected(self, *_args) -> None:
+        if isinstance(self.session, Results):
+            self._render_selection()
+
+    def _render_selection(self) -> None:
+        selected = self.selected_file()
+        if selected is None:
+            return
+        report = selected.report
+        self.path_label.setText(str(report.output if report is not None else selected.source))
         self.reveal_button.setText(reveal_label())
-        rows = finding_rows(report)
+        self.reveal_button.setVisible(report is not None)
+        self.open_button.setVisible(report is not None)
+        found = report or selected.analysis
+        rows = finding_rows(found) if found is not None else []
         self.table.setRowCount(len(rows))
         for row_index, row in enumerate(rows):
             for column, value in enumerate(row):
@@ -553,9 +691,8 @@ class MainWindow(QMainWindow):
                 item.setToolTip(value)
                 self.table.setItem(row_index, column, item)
         self.table.resizeRowsToContents()
-
-    def _render_failed(self, session: Failed) -> None:
-        self.failed_label.setText(session.message)
+        self.table.setVisible(bool(rows))
+        self.results_spacer.setVisible(not rows)
 
     def closeEvent(self, event) -> None:
         app = QApplication.instance()
@@ -622,7 +759,7 @@ def gui(argv: list[str]) -> int:
         application.attach(window)
     paths = pdf_args(argv)
     if paths:
-        window.submit_pdf(paths[0])
+        window.receive_paths(paths)
     window.show()
     return int(application.exec())
 

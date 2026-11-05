@@ -3,6 +3,8 @@ from __future__ import annotations
 import itertools
 import os
 import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import pikepdf
@@ -10,7 +12,7 @@ import pikepdf
 from .content import clean_pages
 from .layers import Layers
 from .metadata import clean_metadata
-from .model import CleanError, OutputNotWritable, Report
+from .model import Analysis, CleanError, OutputNotWritable, Report
 
 PASSWORD_PROTECTED = "This PDF is password-protected. Remove the password and try again."
 NOT_READABLE = "This file could not be read as a PDF. It may be damaged, or it may not be a PDF."
@@ -23,6 +25,17 @@ def suggested_output_path(source: Path) -> Path:
     return next(path for path in map(source.with_name, names) if not path.exists())
 
 
+def analyze_pdf(source: Path) -> Analysis:
+    """Detect invisible marks in `source` and return them. Writes nothing to disk.
+
+    Raises CleanError for unreadable, encrypted or non-PDF input.
+    """
+    source = Path(source).absolute()
+    with opened(source) as pdf:
+        findings = clean_metadata(pdf) + clean_pages(pdf, Layers(pdf))
+        return Analysis(source, len(pdf.pages), tuple(findings))
+
+
 def clean_pdf(source: Path, output: Path | None = None) -> Report:
     """Detect invisible marks in `source`, write a copy without them to `output`
     (default: `suggested_output_path(source)`), and return the report.
@@ -33,15 +46,21 @@ def clean_pdf(source: Path, output: Path | None = None) -> Report:
     output = Path(output).absolute() if output is not None else suggested_output_path(source)
     if output.resolve() == source.resolve():
         raise CleanError("The clean copy can't replace the original file. Choose a different name.")
+    with opened(source) as pdf:
+        layers = Layers(pdf)
+        findings = clean_metadata(pdf) + clean_pages(pdf, layers)
+        layers.prune(pdf)
+        write(pdf, output)
+        return Report(source, output, len(pdf.pages), tuple(findings))
+
+
+@contextmanager
+def opened(source: Path) -> Iterator[pikepdf.Pdf]:
     if not source.is_file():
         raise CleanError(f"Could not find the file {source.name}.")
     try:
         with pikepdf.open(source) as pdf:
-            layers = Layers(pdf)
-            findings = clean_metadata(pdf) + clean_pages(pdf, layers)
-            layers.prune(pdf)
-            write(pdf, output)
-            return Report(source, output, len(pdf.pages), tuple(findings))
+            yield pdf
     except pikepdf.PasswordError:
         raise CleanError(PASSWORD_PROTECTED) from None
     except pikepdf.PdfError:

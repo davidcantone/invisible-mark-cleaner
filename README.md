@@ -4,7 +4,7 @@
 
 ## What it is
 
-Invisible Mark Cleaner is a desktop program for one PDF. It looks for text marks that do not show on the page, shows a report in the window, and saves a clean copy next to the original file. The original file does not change.
+Invisible Mark Cleaner is a desktop program for PDF files. It checks one or more PDFs for text marks that do not show on the page and shows a report in the window. Checking saves nothing. Only when marks were found, and only after you click **Clean PDF**, it saves a clean copy next to each affected file. The original files do not change.
 
 There is no server, no account, and no telemetry. The program opens no network connections.
 
@@ -29,11 +29,12 @@ The report can include these marks.
 ## How to use it
 
 1. Open Invisible Mark Cleaner.
-2. Drop one PDF on the window, or click **Choose PDF...**.
-3. Read the report. The table columns are Page, Type, Text, and Details. When a mark is not tied to a page, the Page column says Document.
-4. The clean copy is saved in the same folder. The name is `name-clean.pdf`. When that file already exists, the name becomes `name-clean-2.pdf`, then `name-clean-3.pdf`, and so on.
+2. Drop one or more PDFs on the window, or click **Choose PDFs...** and select one or more files. The dialog opens in the folder you used last time.
+3. Read the report. Nothing has been saved yet. With several PDFs, a list shows the result for each file; select a file to see its marks. The table columns are Page, Type, Text, and Details. When a mark is not tied to a page, the Page column says Document.
+4. When no marks are found, the report says so, the **Clean PDF** button stays disabled, and no clean copy is made.
+5. When marks are found, click **Clean PDF** (with several affected files, **Clean 2 PDFs** and so on). Only the files with marks are cleaned. Each clean copy is saved in the same folder as its original. The name is `name-clean.pdf`. When that file already exists, the name becomes `name-clean-2.pdf`, then `name-clean-3.pdf`, and so on.
 
-When the folder cannot be written, the program asks for another path. When no marks are found, the report says so and the clean copy is saved anyway.
+When a folder cannot be written, the program asks for another path for that file. Files that cannot be read, such as password-protected PDFs, are listed with the reason and skipped.
 
 ## Privacy
 
@@ -124,10 +125,10 @@ python -m pytest
 To open the window on Linux without a physical display.
 
 ```bash
-xvfb-run -a python scripts/ui_smoke.py tests/fixtures/white_text.pdf /tmp/ui-smoke
+xvfb-run -a python scripts/ui_smoke.py tests/fixtures/white_text.pdf tests/fixtures/clean_document.pdf /tmp/ui-smoke
 ```
 
-The script opens the window, drops the PDF through the same path as a drag, waits for the report, and saves `idle.png` and `done.png`.
+The script opens the window, drops the PDFs through the same path as a drag, waits for the report, and saves `idle.png` and `report.png`. When marks were found, it then clicks **Clean PDF**, waits, and saves `done.png`.
 
 ## Known limitations
 
@@ -141,5 +142,5 @@ The script opens the window, drops the PDF through the same path as a drag, wait
 - **Reused forms.** A form XObject is decided once, against the background of its first use. If it is reused over a different background, that decision applies to every use.
 - **Not inspected.** Annotations and form fields, tiling patterns, Type3 glyph procedures, off-page text and tiny text.
 - **Metadata.** Non-standard Info keys and XMP namespaces are always removed. Standard fields (Title, Subject, Keywords, Producer...) are removed only when they read like instructions to a model or opaque tracking tokens. This is a heuristic and can miss or over-match.
-- **One file at a time.** Folder mode is a TODO.
+- **No folder mode.** Several PDFs can be checked at once, but a dropped folder is not searched for PDFs.
 - **Unsigned builds.** The `.app` and `.exe` are unsigned. See "Signing and notarization".

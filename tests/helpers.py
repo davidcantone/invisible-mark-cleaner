@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from invisible_mark_cleaner.model import Finding, MarkKind, Report
+from invisible_mark_cleaner.model import Analysis, Finding, MarkKind, Report
 
 LONG_TEXT = "hidden fragment " * 12
 
@@ -12,6 +12,16 @@ DEFAULT_FINDINGS = (
     Finding(MarkKind.INVISIBLE_TEXT, 2, "render mode three", "text render mode 3"),
     Finding(MarkKind.METADATA, None, "Author", "marker-like Info field"),
 )
+
+
+def sample_analysis(
+    source: Path,
+    findings: tuple[Finding, ...] | None = None,
+    page_count: int = 2,
+) -> Analysis:
+    if findings is None:
+        findings = DEFAULT_FINDINGS
+    return Analysis(source=source, page_count=page_count, findings=findings)
 
 
 def sample_report(

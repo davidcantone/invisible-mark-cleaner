@@ -2,14 +2,19 @@ from pathlib import Path
 
 from invisible_mark_cleaner.model import Finding, MarkKind, Report
 from invisible_mark_cleaner.present import (
+    analysis_summary,
+    clean_label,
+    file_status,
     finding_rows,
     format_report,
     report_payload,
+    results_summary,
     reveal_command,
     reveal_label,
     summary,
 )
-from tests.helpers import sample_report
+from invisible_mark_cleaner.session import FileResult
+from tests.helpers import sample_analysis, sample_report
 
 
 def _report(tmp_path: Path, findings) -> Report:
@@ -83,3 +88,54 @@ def test_reveal_commands_match_the_desktop():
     assert reveal_command(path, "Windows") == ["explorer", "/select," + str(path)]
     assert reveal_label("Linux") == "Show in folder"
     assert reveal_command(path, "Linux") == ["xdg-open", str(path.parent)]
+
+
+def test_analysis_summary_says_what_was_found_and_that_nothing_was_saved(tmp_path):
+    source = tmp_path / "notes.pdf"
+    assert analysis_summary(sample_analysis(source)) == "Found 4 invisible marks on 2 pages."
+    assert analysis_summary(sample_analysis(source, findings=())) == (
+        "No invisible marks found. No clean copy was made."
+    )
+    one = (Finding(MarkKind.METADATA, None, "Author", "Info"),)
+    assert analysis_summary(sample_analysis(source, findings=one)) == "Found 1 invisible mark."
+
+
+def test_clean_button_names_how_many_pdfs_it_cleans():
+    assert clean_label(0) == "Clean PDF"
+    assert clean_label(1) == "Clean PDF"
+    assert clean_label(3) == "Clean 3 PDFs"
+
+
+def test_single_file_summary_follows_the_file_through_cleaning(tmp_path):
+    source = tmp_path / "notes.pdf"
+    source.write_bytes(b"%PDF-1.4\n")
+    checked = FileResult(source, analysis=sample_analysis(source))
+    assert results_summary((checked,)) == (
+        "Found 4 invisible marks on 2 pages. Click Clean PDF to save a clean copy."
+    )
+    assert file_status(checked) == "4 invisible marks on 2 pages"
+    cleaned = FileResult(source, analysis=checked.analysis, report=sample_report(source))
+    assert results_summary((cleaned,)) == "Removed 4 invisible marks on 2 pages."
+    assert file_status(cleaned) == "Cleaned: notes-clean.pdf"
+    failed = FileResult(source, analysis=checked.analysis, clean_error="That folder is not writable.")
+    assert results_summary((failed,)) == "Found 4 invisible marks on 2 pages. That folder is not writable."
+    assert file_status(failed) == "That folder is not writable."
+    unreadable = FileResult(source, error="This PDF is encrypted.")
+    assert results_summary((unreadable,)) == "This PDF is encrypted."
+    assert file_status(unreadable) == "This PDF is encrypted."
+    nothing = FileResult(source, analysis=sample_analysis(source, findings=()))
+    assert file_status(nothing) == "No invisible marks"
+
+
+def test_several_files_summary_counts_marked_cleaned_and_unreadable(tmp_path):
+    source = tmp_path / "notes.pdf"
+    source.write_bytes(b"%PDF-1.4\n")
+    marked = FileResult(source, analysis=sample_analysis(source))
+    plain = FileResult(source, analysis=sample_analysis(source, findings=()))
+    unreadable = FileResult(source, error="This PDF is encrypted.")
+    cleaned = FileResult(source, analysis=marked.analysis, report=sample_report(source))
+    assert results_summary((plain, plain)) == "Checked 2 PDFs. None has invisible marks. No clean copy was made."
+    assert results_summary((marked, plain)) == "Checked 2 PDFs. 1 has invisible marks."
+    assert results_summary((marked, cleaned, unreadable)) == (
+        "Checked 3 PDFs. 2 have invisible marks. 1 cleaned. 1 could not be read."
+    )
