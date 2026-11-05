@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "invisible-mark-cleaner"
+version = "1.0.0"
+description = "Desktop app that removes invisible text and hidden marks from PDF files, locally."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10,<3.13"
+# Pinned to the last releases that ship wheels for macOS 12 on Intel (x86_64).
+dependencies = [
+    "pikepdf==9.3.0",
+    "PySide6-Essentials==6.9.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pypdf>=5",
+    "pypdfium2==5.11.0",
+    "pillow>=10",
+    "pyinstaller>=6.10",
+]
+
+[project.scripts]
+invisible-mark-cleaner-cli = "invisible_mark_cleaner.cli:main"
+
+[project.gui-scripts]
+invisible-mark-cleaner = "invisible_mark_cleaner.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
