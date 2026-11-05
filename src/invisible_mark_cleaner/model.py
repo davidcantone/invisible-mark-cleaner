@@ -25,11 +25,7 @@ class Finding:
     detail: str
 
 
-@dataclass(frozen=True)
-class Report:
-    source: Path
-    output: Path
-    page_count: int
+class _Findings:
     findings: tuple[Finding, ...]
 
     def count(self, kind: MarkKind) -> int:
@@ -38,6 +34,25 @@ class Report:
     @property
     def pages_affected(self) -> tuple[int, ...]:
         return tuple(sorted({f.page for f in self.findings if f.page is not None}))
+
+
+@dataclass(frozen=True)
+class Analysis(_Findings):
+    source: Path
+    page_count: int
+    findings: tuple[Finding, ...]
+
+    @property
+    def has_marks(self) -> bool:
+        return bool(self.findings)
+
+
+@dataclass(frozen=True)
+class Report(_Findings):
+    source: Path
+    output: Path
+    page_count: int
+    findings: tuple[Finding, ...]
 
 
 class CleanError(Exception):
