@@ -8,3 +8,4 @@ dist/
 *-clean.pdf
 *-clean-*.pdf
 *.report.json
+.github/workflows/
